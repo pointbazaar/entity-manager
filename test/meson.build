@@ -37,6 +37,7 @@ test(
             sdbusplus,
             zlib_dep,
         ],
+        link_with: utils_lib,
         include_directories: test_include_dir,
     ),
 )
@@ -73,6 +74,17 @@ test(
         include_directories: test_include_dir,
         link_with: utils_lib,
         dependencies: [gtest, phosphor_logging_dep, sdbusplus],
+    ),
+)
+
+test(
+    'test_dbus_regex',
+    executable(
+        'test_dbus_regex',
+        'test_dbus_regex.cpp',
+        '../src/dbus_regex.cpp',
+        include_directories: test_include_dir,
+        dependencies: [gtest],
     ),
 )
 
