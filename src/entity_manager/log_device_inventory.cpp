@@ -1,6 +1,7 @@
 #include "log_device_inventory.hpp"
 
 #include "../utils.hpp"
+#include "em_config.hpp"
 
 #include <systemd/sd-journal.h>
 
@@ -31,33 +32,36 @@ static void setStringIfFound(std::string& value, const std::string& key,
     }
 }
 
-InvAddRemoveInfo queryInvInfo(const nlohmann::json& record)
+InvAddRemoveInfo queryInvInfo(const EMConfig& record)
 {
     InvAddRemoveInfo ret;
 
-    setStringIfFound(ret.type, "Type", record);
-    setStringIfFound(ret.name, "Name", record);
+    ret.type = record.type;
+    ret.name = record.name;
 
-    const nlohmann::json::const_iterator findAsset = record.find(
-        sdbusplus::common::xyz::openbmc_project::inventory::decorator::Asset::
-            interface);
+    const std::string key = sdbusplus::common::xyz::openbmc_project::inventory::
+        decorator::Asset::interface;
 
-    if (findAsset != record.end())
+    if (record.extraInterfaces.contains(key))
     {
-        setStringIfFound(ret.model, "Model", *findAsset);
-        setStringIfFound(ret.sn, "SerialNumber", *findAsset, true);
+        const nlohmann::json::object_t& findAsset =
+            record.extraInterfaces.at(key);
+
+        setStringIfFound(ret.model, "Model", findAsset);
+        setStringIfFound(ret.sn, "SerialNumber", findAsset, true);
     }
 
     return ret;
 }
 
-void logDeviceAdded(const nlohmann::json& record)
+void logDeviceAdded(const EMConfig& record)
 {
     if (!EM_CACHE_CONFIGURATION)
     {
         return;
     }
-    if (!deviceHasLogging(record))
+
+    if (!record.deviceHasLogging)
     {
         return;
     }
@@ -71,9 +75,9 @@ void logDeviceAdded(const nlohmann::json& record)
         info.sn.c_str(), "NAME=%s", info.name.c_str(), NULL);
 }
 
-void logDeviceRemoved(const nlohmann::json& record)
+void logDeviceRemoved(const EMConfig& record)
 {
-    if (!deviceHasLogging(record))
+    if (!record.deviceHasLogging)
     {
         return;
     }

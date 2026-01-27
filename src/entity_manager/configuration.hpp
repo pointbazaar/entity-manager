@@ -1,6 +1,11 @@
 #pragma once
 
+#include "config_pointer.hpp"
+#include "em_config.hpp"
+#include "system_configuration.hpp"
+
 #include <nlohmann/json.hpp>
+#include <phosphor-logging/lg2.hpp>
 
 #include <unordered_set>
 #include <vector>
@@ -14,7 +19,7 @@ class Configuration
         const std::vector<std::filesystem::path>& configurationDirectories,
         const std::filesystem::path& schemaDirectory);
     std::unordered_set<std::string> probeInterfaces;
-    std::vector<nlohmann::json> configurations;
+    std::vector<EMConfig> configurations;
 
     const std::filesystem::path schemaDirectory;
 
@@ -26,18 +31,15 @@ class Configuration
     std::vector<std::filesystem::path> configurationDirectories;
 };
 
-bool writeJsonFiles(const nlohmann::json& systemConfiguration);
+bool writeJsonFiles(const SystemConfiguration& systemConfiguration);
 
 template <typename JsonType>
-bool setJsonFromPointer(const std::string& ptrStr, const JsonType& value,
-                        nlohmann::json& systemConfiguration)
+bool setJsonFromPointer(const ConfigPointer& configPtr, const JsonType& value,
+                        SystemConfiguration& systemConfiguration)
 {
     try
     {
-        nlohmann::json::json_pointer ptr(ptrStr);
-        nlohmann::json& ref = systemConfiguration[ptr];
-        ref = value;
-        return true;
+        return configPtr.write(value, systemConfiguration);
     }
     catch (const nlohmann::json::out_of_range&)
     {
@@ -45,8 +47,8 @@ bool setJsonFromPointer(const std::string& ptrStr, const JsonType& value,
     }
 }
 
-void deriveNewConfiguration(const nlohmann::json& oldConfiguration,
-                            nlohmann::json& newConfiguration);
+void deriveNewConfiguration(const SystemConfiguration& oldConfiguration,
+                            SystemConfiguration& newConfiguration);
 
 bool validateJson(const nlohmann::json& schemaFile,
                   const nlohmann::json& input);

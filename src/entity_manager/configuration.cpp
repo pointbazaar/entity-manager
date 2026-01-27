@@ -1,5 +1,6 @@
 #include "configuration.hpp"
 
+#include "em_config.hpp"
 #include "perform_probe.hpp"
 #include "utils.hpp"
 
@@ -88,12 +89,20 @@ void Configuration::loadConfigurations()
         {
             for (auto& d : data)
             {
-                configurations.emplace_back(d);
+                auto optConfig = EMConfig::fromJson(d);
+                if (optConfig.has_value())
+                {
+                    configurations.emplace_back(optConfig.value());
+                }
             }
         }
         else
         {
-            configurations.emplace_back(data);
+            auto optConfig = EMConfig::fromJson(data);
+            if (optConfig.has_value())
+            {
+                configurations.emplace_back(optConfig.value());
+            }
         }
     }
 
@@ -108,22 +117,23 @@ void Configuration::loadConfigurations()
 }
 
 // Iterate over new configuration and erase items from old configuration.
-void deriveNewConfiguration(const nlohmann::json& oldConfiguration,
-                            nlohmann::json& newConfiguration)
+void deriveNewConfiguration(const SystemConfiguration& oldConfiguration,
+                            SystemConfiguration& newConfiguration)
 {
     lg2::debug("deriving new configuration");
 
-    for (auto it = newConfiguration.begin(); it != newConfiguration.end();)
+    std::set<std::string> deletion;
+    for (auto [k, v] : newConfiguration)
     {
-        auto findKey = oldConfiguration.find(it.key());
-        if (findKey != oldConfiguration.end())
+        if (oldConfiguration.contains(k))
         {
-            it = newConfiguration.erase(it);
+            deletion.insert(k);
         }
-        else
-        {
-            it++;
-        }
+    }
+
+    for (const auto& k : deletion)
+    {
+        newConfiguration.erase(k);
     }
 }
 
@@ -144,57 +154,47 @@ void Configuration::filterProbeInterfaces()
 {
     for (auto it = configurations.begin(); it != configurations.end();)
     {
-        auto findProbe = it->find("Probe");
-        if (findProbe == it->end())
+        for (const std::string& probe : it->probeStmt)
         {
-            lg2::error("configuration file missing probe: {PROBE}", "PROBE",
-                       *it);
-            it++;
-            continue;
-        }
-
-        nlohmann::json probeCommand;
-        if ((*findProbe).type() != nlohmann::json::value_t::array)
-        {
-            probeCommand = nlohmann::json::array();
-            probeCommand.push_back(*findProbe);
-        }
-        else
-        {
-            probeCommand = *findProbe;
-        }
-
-        for (const nlohmann::json& probeJson : probeCommand)
-        {
-            const std::string* probe = probeJson.get_ptr<const std::string*>();
-            if (probe == nullptr)
-            {
-                lg2::error("Probe statement wasn't a string, can't parse");
-                continue;
-            }
             // Skip it if the probe cmd doesn't contain an interface.
-            if (probe::findProbeType(*probe))
+            if (probe::findProbeType(probe))
             {
                 continue;
             }
 
             // syntax requires probe before first open brace
-            auto findStart = probe->find('(');
+            auto findStart = probe.find('(');
             if (findStart != std::string::npos)
             {
-                std::string interface = probe->substr(0, findStart);
-                probeInterfaces.emplace(interface);
+                std::string interface = probe.substr(0, findStart);
+
+                const auto [_, didEmplace] = probeInterfaces.emplace(interface);
+
+                if (didEmplace)
+                {
+                    lg2::debug("found probe interface: {INTF}", "INTF",
+                               interface);
+                }
             }
         }
         it++;
     }
+
+    lg2::debug("Done filtering {N} probe interfaces from configurations", "N",
+               probeInterfaces.size());
 }
 
-bool writeJsonFiles(const nlohmann::json& systemConfiguration)
+bool writeJsonFiles(const SystemConfiguration& systemConfigurationIn)
 {
     if (!EM_CACHE_CONFIGURATION)
     {
         return true;
+    }
+
+    nlohmann::json::object_t out;
+    for (const auto& [k, v] : systemConfigurationIn)
+    {
+        out[k] = v.toJson();
     }
 
     std::error_code ec;
@@ -204,15 +204,15 @@ bool writeJsonFiles(const nlohmann::json& systemConfiguration)
         return false;
     }
 
-    lg2::debug("writing system configuration to {PATH}", "PATH",
-               currentConfiguration);
+    lg2::debug("writing system configuration for {N} boards to {PATH}", "N",
+               systemConfigurationIn.size(), "PATH", currentConfiguration);
 
     std::ofstream output(currentConfiguration);
     if (!output.good())
     {
         return false;
     }
-    output << systemConfiguration.dump(4);
+    output << nlohmann::json(out).dump(4);
     output.close();
     return true;
 }

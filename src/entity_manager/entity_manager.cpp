@@ -5,6 +5,7 @@
 
 #include "../utils.hpp"
 #include "../variant_visitors.hpp"
+#include "config_pointer.hpp"
 #include "configuration.hpp"
 #include "dbus_interface.hpp"
 #include "log_device_inventory.hpp"
@@ -57,9 +58,8 @@ EntityManager::EntityManager(
     const std::filesystem::path& schemaDirectory) :
     systemBus(systemBus),
     objServer(sdbusplus::asio::object_server(systemBus, /*skipManager=*/true)),
-    configuration(configurationDirectories, schemaDirectory),
-    lastJson(nlohmann::json::object()),
-    systemConfiguration(nlohmann::json::object()), io(io),
+    configuration(configurationDirectories, schemaDirectory), lastJson(),
+    systemConfiguration(), io(io),
     dbus_interface(io, objServer, schemaDirectory), powerStatus(*systemBus),
     propertiesChangedTimer(io)
 {
@@ -79,22 +79,14 @@ EntityManager::EntityManager(
     initFilters(configuration.probeInterfaces);
 }
 
-void EntityManager::postToDbus(const nlohmann::json& newConfiguration)
+void EntityManager::postToDbus(const SystemConfiguration& newConfiguration)
 {
     std::map<std::string, std::string> newBoards; // path -> name
 
     // iterate through boards
-    for (const auto& [boardId, boardConfig] : newConfiguration.items())
+    for (const auto& [boardId, boardConfig] : newConfiguration)
     {
-        const nlohmann::json::object_t* boardConfigPtr =
-            boardConfig.get_ptr<const nlohmann::json::object_t*>();
-        if (boardConfigPtr == nullptr)
-        {
-            lg2::error("boardConfig for {BOARD} was not an object", "BOARD",
-                       boardId);
-            continue;
-        }
-        postBoardToDBus(boardId, *boardConfigPtr, newBoards);
+        postBoardToDBus(boardId, boardConfig, newBoards);
     }
 
     for (const auto& [assocPath, assocPropValue] :
@@ -118,43 +110,25 @@ void EntityManager::postToDbus(const nlohmann::json& newConfiguration)
 }
 
 void EntityManager::postBoardToDBus(
-    const std::string& boardId, const nlohmann::json::object_t& boardConfig,
+    const std::string& boardId, const EMConfig& boardConfig,
     std::map<std::string, std::string>& newBoards)
 {
-    auto boardNameIt = boardConfig.find("Name");
-    if (boardNameIt == boardConfig.end())
+    std::string boardName = boardConfig.name;
+    std::string boardNameOrig = boardConfig.name;
+
+    if (!systemConfiguration.contains(boardId))
     {
-        lg2::error("Unable to find name for {BOARD}", "BOARD", boardId);
+        lg2::error(
+            "system configuration did not contain board with id: {BOARDID}",
+            "BOARDID", boardId);
         return;
     }
-    const std::string* boardNamePtr =
-        boardNameIt->second.get_ptr<const std::string*>();
-    if (boardNamePtr == nullptr)
-    {
-        lg2::error("Name for {BOARD} was not a string", "BOARD", boardId);
-        return;
-    }
-    std::string boardName = *boardNamePtr;
-    std::string boardNameOrig = *boardNamePtr;
-    std::string jsonPointerPath = "/" + boardId;
+
     // loop through newConfiguration, but use values from system
     // configuration to be able to modify via dbus later
-    auto boardValues = systemConfiguration[boardId];
-    auto findBoardType = boardValues.find("Type");
-    std::string boardType;
-    if (findBoardType != boardValues.end() &&
-        findBoardType->type() == nlohmann::json::value_t::string)
-    {
-        boardType = findBoardType->get<std::string>();
-        std::regex_replace(boardType.begin(), boardType.begin(),
-                           boardType.end(), illegalDbusMemberRegex, "_");
-    }
-    else
-    {
-        lg2::error("Unable to find type for {BOARD} reverting to Chassis.",
-                   "BOARD", boardName);
-        boardType = "Chassis";
-    }
+    EMConfig boardValues = systemConfiguration.at(boardId);
+
+    std::string boardType = boardValues.type;
 
     lg2::debug("post {TYPE} '{NAME}' to DBus", "TYPE", boardType, "NAME",
                boardName);
@@ -176,42 +150,31 @@ void EntityManager::postBoardToDBus(
     std::shared_ptr<sdbusplus::asio::dbus_interface> boardIface =
         dbus_interface.createInterface(boardPath, invItemIntf, boardNameOrig);
 
-    dbus_interface.createAddObjectMethod(jsonPointerPath, boardPath,
+    dbus_interface.createAddObjectMethod(boardId, boardPath,
                                          systemConfiguration, boardNameOrig);
 
+    nlohmann::json::object_t boardProps;
+    boardProps["Name"] = boardValues.name;
+    boardProps["Type"] = boardValues.type;
+
     dbus_interface.populateInterfaceFromJson(
-        systemConfiguration, jsonPointerPath, boardIface, boardValues);
-    jsonPointerPath += "/";
+        systemConfiguration, ConfigPointer(boardId), boardIface, boardProps);
+
     // iterate through board properties
-    for (const auto& [propName, propValue] : boardValues.items())
+    for (const auto& [propName, propValue] : boardValues.extraInterfaces)
     {
-        if (propValue.type() == nlohmann::json::value_t::object)
-        {
-            std::shared_ptr<sdbusplus::asio::dbus_interface> iface =
-                dbus_interface.createInterface(boardPath, propName,
-                                               boardNameOrig);
+        std::shared_ptr<sdbusplus::asio::dbus_interface> iface =
+            dbus_interface.createInterface(boardPath, propName, boardNameOrig);
 
-            dbus_interface.populateInterfaceFromJson(
-                systemConfiguration, jsonPointerPath + propName, iface,
-                propValue);
-        }
+        dbus_interface.populateInterfaceFromJson(
+            systemConfiguration, ConfigPointer(boardId, propName), iface,
+            propValue);
     }
 
-    nlohmann::json::iterator exposes = boardValues.find("Exposes");
-    if (exposes == boardValues.end())
-    {
-        return;
-    }
-    // iterate through exposes
-    jsonPointerPath += "Exposes/";
-
-    // store the board level pointer so we can modify it on the way down
-    std::string jsonPointerPathBoard = jsonPointerPath;
     size_t exposesIndex = -1;
-    for (nlohmann::json& item : *exposes)
+    for (nlohmann::json::object_t& item : boardValues.exposesRecords)
     {
-        postExposesRecordsToDBus(item, exposesIndex, boardNameOrig,
-                                 jsonPointerPath, jsonPointerPathBoard,
+        postExposesRecordsToDBus(item, exposesIndex, boardNameOrig, boardId,
                                  boardPath, boardType);
     }
 
@@ -219,26 +182,25 @@ void EntityManager::postBoardToDBus(
 }
 
 void EntityManager::postExposesRecordsToDBus(
-    nlohmann::json& item, size_t& exposesIndex,
-    const std::string& boardNameOrig, std::string jsonPointerPath,
-    const std::string& jsonPointerPathBoard, const std::string& boardPath,
-    const std::string& boardType)
+    nlohmann::json::object_t& item, size_t& exposesIndex,
+    const std::string& boardNameOrig, const std::string& boardId,
+    const std::string& boardPath, const std::string& boardType)
 {
     exposesIndex++;
-    jsonPointerPath = jsonPointerPathBoard;
-    jsonPointerPath += std::to_string(exposesIndex);
+    const ConfigPointer configPointerPath(boardId, exposesIndex);
 
     auto findName = item.find("Name");
     if (findName == item.end())
     {
-        lg2::error("cannot find name in field {ITEM}", "ITEM", item);
+        lg2::error("cannot find name in field {ITEM}", "ITEM",
+                   nlohmann::json(item));
         return;
     }
     auto findStatus = item.find("Status");
     // if status is not found it is assumed to be status = 'okay'
     if (findStatus != item.end())
     {
-        if (*findStatus == "disabled")
+        if (item["Status"] == "disabled")
         {
             return;
         }
@@ -247,7 +209,7 @@ void EntityManager::postExposesRecordsToDBus(
     std::string itemType;
     if (findType != item.end())
     {
-        itemType = findType->get<std::string>();
+        itemType = item["Type"].get<std::string>();
         std::regex_replace(itemType.begin(), itemType.begin(), itemType.end(),
                            illegalDbusPathRegex, "_");
     }
@@ -255,7 +217,7 @@ void EntityManager::postExposesRecordsToDBus(
     {
         itemType = "unknown";
     }
-    std::string itemName = findName->get<std::string>();
+    std::string itemName = item["Name"].get<std::string>();
     std::regex_replace(itemName.begin(), itemName.begin(), itemName.end(),
                        illegalDbusMemberRegex, "_");
     std::string ifacePath = boardPath;
@@ -271,7 +233,7 @@ void EntityManager::postExposesRecordsToDBus(
                     interface,
                 boardNameOrig);
         dbus_interface.populateInterfaceFromJson(
-            systemConfiguration, jsonPointerPath, bmcIface, item,
+            systemConfiguration, configPointerPath, bmcIface, item,
             getPermission(itemType));
     }
     else if (itemType == "System")
@@ -283,19 +245,16 @@ void EntityManager::postExposesRecordsToDBus(
                     System::interface,
                 boardNameOrig);
         dbus_interface.populateInterfaceFromJson(
-            systemConfiguration, jsonPointerPath, systemIface, item,
+            systemConfiguration, configPointerPath, systemIface, item,
             getPermission(itemType));
     }
 
-    for (const auto& [name, config] : item.items())
+    for (auto& [name, config] : item)
     {
-        jsonPointerPath = jsonPointerPathBoard;
-        jsonPointerPath.append(std::to_string(exposesIndex))
-            .append("/")
-            .append(name);
-
-        if (!postConfigurationRecord(name, config, boardNameOrig, itemType,
-                                     jsonPointerPath, ifacePath))
+        if (!postConfigurationRecord(
+                name, config, boardNameOrig, itemType,
+                configPointerPath.withExposesIndexAndName(exposesIndex, name),
+                ifacePath))
         {
             break;
         }
@@ -307,7 +266,7 @@ void EntityManager::postExposesRecordsToDBus(
             boardNameOrig);
 
     dbus_interface.populateInterfaceFromJson(
-        systemConfiguration, jsonPointerPath, itemIface, item,
+        systemConfiguration, configPointerPath, itemIface, item,
         getPermission(itemType));
 
     topology.addBoard(boardPath, boardType, boardNameOrig, item);
@@ -316,7 +275,7 @@ void EntityManager::postExposesRecordsToDBus(
 bool EntityManager::postConfigurationRecord(
     const std::string& name, nlohmann::json& config,
     const std::string& boardNameOrig, const std::string& itemType,
-    const std::string& jsonPointerPath, const std::string& ifacePath)
+    const ConfigPointer& configPtr, const std::string& ifacePath)
 {
     if (config.type() == nlohmann::json::value_t::object)
     {
@@ -326,8 +285,10 @@ bool EntityManager::postConfigurationRecord(
         std::shared_ptr<sdbusplus::asio::dbus_interface> objectIface =
             dbus_interface.createInterface(ifacePath, ifaceName, boardNameOrig);
 
+        auto* configObj = config.get_ptr<nlohmann::json::object_t*>();
+
         dbus_interface.populateInterfaceFromJson(
-            systemConfiguration, jsonPointerPath, objectIface, config,
+            systemConfiguration, configPtr, objectIface, *configObj,
             getPermission(name));
     }
     else if (config.type() == nlohmann::json::value_t::array)
@@ -361,6 +322,15 @@ bool EntityManager::postConfigurationRecord(
 
         for (auto& arrayItem : config)
         {
+            const nlohmann::json::object_t* arrayItemObj =
+                arrayItem.get_ptr<const nlohmann::json::object_t*>();
+
+            if (arrayItemObj == nullptr)
+            {
+                lg2::error("array item was not an object");
+                continue;
+            }
+
             std::string ifaceName = "xyz.openbmc_project.Configuration.";
             ifaceName.append(itemType).append(".").append(name);
             ifaceName.append(std::to_string(index));
@@ -370,9 +340,8 @@ bool EntityManager::postConfigurationRecord(
                                                boardNameOrig);
 
             dbus_interface.populateInterfaceFromJson(
-                systemConfiguration,
-                jsonPointerPath + "/" + std::to_string(index), objectIface,
-                arrayItem, getPermission(name));
+                systemConfiguration, configPtr.withArrayIndex(index),
+                objectIface, *arrayItemObj, getPermission(name));
             index++;
         }
     }
@@ -380,33 +349,16 @@ bool EntityManager::postConfigurationRecord(
     return true;
 }
 
-static bool deviceRequiresPowerOn(const nlohmann::json& entity)
-{
-    auto powerState = entity.find("PowerState");
-    if (powerState == entity.end())
-    {
-        return false;
-    }
-
-    const auto* ptr = powerState->get_ptr<const std::string*>();
-    if (ptr == nullptr)
-    {
-        return false;
-    }
-
-    return *ptr == "On" || *ptr == "BiosPost";
-}
-
-static void pruneDevice(const nlohmann::json& systemConfiguration,
+static void pruneDevice(const SystemConfiguration& systemConfiguration,
                         const bool powerOff, const bool scannedPowerOff,
-                        const std::string& name, const nlohmann::json& device)
+                        const std::string& name, const EMConfig& device)
 {
     if (systemConfiguration.contains(name))
     {
         return;
     }
 
-    if (deviceRequiresPowerOn(device) && (powerOff || scannedPowerOff))
+    if (powerOff || scannedPowerOff)
     {
         return;
     }
@@ -438,7 +390,7 @@ void EntityManager::startRemovedTimer(boost::asio::steady_timer& timer)
         }
 
         bool powerOff = !powerStatus.isPowerOn();
-        for (const auto& [name, device] : lastJson.items())
+        for (const auto& [name, device] : lastJson)
         {
             pruneDevice(systemConfiguration, powerOff, scannedPowerOff, name,
                         device);
@@ -452,12 +404,12 @@ void EntityManager::startRemovedTimer(boost::asio::steady_timer& timer)
     });
 }
 
-void EntityManager::pruneConfiguration(bool powerOff, const std::string& name,
-                                       const nlohmann::json& device)
+void EntityManager::pruneConfiguration(
+    bool powerOff, const std::string& boardId, const EMConfig& device)
 {
     lg2::debug("pruning configuration");
 
-    if (powerOff && deviceRequiresPowerOn(device))
+    if (powerOff)
     {
         // power not on yet, don't know if it's there or not
         return;
@@ -474,8 +426,8 @@ void EntityManager::pruneConfiguration(bool powerOff, const std::string& name,
     }
 
     ifaces.clear();
-    systemConfiguration.erase(name);
-    topology.remove(device["Name"].get<std::string>());
+    systemConfiguration.erase(boardId);
+    topology.remove(device.name);
     logDeviceRemoved(device);
 }
 
@@ -488,7 +440,7 @@ void EntityManager::publishNewConfiguration(
     // https://discord.com/channels/775381525260664832/867820390406422538/958048437729910854
     //
     // NOLINTNEXTLINE(performance-unnecessary-value-param)
-    const nlohmann::json newConfiguration)
+    const SystemConfiguration newConfiguration)
 {
     loadOverlays(newConfiguration, io);
 
@@ -518,63 +470,62 @@ void EntityManager::propertiesChangedCallback()
     propertiesChangedTimer.expires_after(std::chrono::milliseconds(500));
 
     // setup an async wait as we normally get flooded with new requests
-    propertiesChangedTimer.async_wait(
-        [this, count](const boost::system::error_code& ec) {
-            lg2::debug("properties changed callback timer expired");
-            if (ec == boost::asio::error::operation_aborted)
-            {
-                // we were cancelled
-                return;
-            }
-            if (ec)
-            {
-                lg2::error("async wait error {ERR}", "ERR", ec.message());
-                return;
-            }
+    propertiesChangedTimer.async_wait([this, count](
+                                          const boost::system::error_code& ec) {
+        lg2::debug("properties changed callback timer expired");
+        if (ec == boost::asio::error::operation_aborted)
+        {
+            // we were cancelled
+            return;
+        }
+        if (ec)
+        {
+            lg2::error("async wait error {ERR}", "ERR", ec.message());
+            return;
+        }
 
-            if (propertiesChangedInProgress)
-            {
-                propertiesChangedCallback();
-                return;
-            }
-            propertiesChangedInProgress = true;
+        if (propertiesChangedInProgress)
+        {
+            propertiesChangedCallback();
+            return;
+        }
+        propertiesChangedInProgress = true;
 
-            lg2::debug("properties changed callback in progress");
+        lg2::debug("properties changed callback in progress");
 
-            nlohmann::json oldConfiguration = systemConfiguration;
-            auto missingConfigurations = std::make_shared<nlohmann::json>();
-            *missingConfigurations = systemConfiguration;
+        SystemConfiguration oldConfiguration = systemConfiguration;
+        auto missingConfigurations = std::make_shared<SystemConfiguration>();
+        *missingConfigurations = systemConfiguration;
 
-            auto perfScan = std::make_shared<scan::PerformScan>(
-                *this, *missingConfigurations, configuration.configurations, io,
-                [this, count, oldConfiguration, missingConfigurations]() {
-                    // this is something that since ac has been applied to the
-                    // bmc we saw, and we no longer see it
-                    bool powerOff = !powerStatus.isPowerOn();
-                    for (const auto& [name, device] :
-                         missingConfigurations->items())
-                    {
-                        pruneConfiguration(powerOff, name, device);
-                    }
-                    nlohmann::json newConfiguration = systemConfiguration;
+        auto perfScan = std::make_shared<scan::PerformScan>(
+            *this, *missingConfigurations, configuration.configurations, io,
+            [this, count, oldConfiguration, missingConfigurations]() {
+                // this is something that since ac has been applied to the
+                // bmc we saw, and we no longer see it
+                bool powerOff = !powerStatus.isPowerOn();
+                for (const auto& [name, device] : *missingConfigurations)
+                {
+                    pruneConfiguration(powerOff, name, device);
+                }
+                SystemConfiguration newConfiguration = systemConfiguration;
 
-                    deriveNewConfiguration(oldConfiguration, newConfiguration);
+                deriveNewConfiguration(oldConfiguration, newConfiguration);
 
-                    for (const auto& [_, device] : newConfiguration.items())
-                    {
-                        logDeviceAdded(device);
-                    }
+                for (const auto& [_, device] : newConfiguration)
+                {
+                    logDeviceAdded(device);
+                }
 
-                    propertiesChangedInProgress = false;
+                propertiesChangedInProgress = false;
 
-                    boost::asio::post(io, [this, newConfiguration, count] {
-                        publishNewConfiguration(
-                            std::ref(propertiesChangedInstance), count,
-                            std::ref(propertiesChangedTimer), newConfiguration);
-                    });
+                boost::asio::post(io, [this, newConfiguration, count] {
+                    publishNewConfiguration(
+                        std::ref(propertiesChangedInstance), count,
+                        std::ref(propertiesChangedTimer), newConfiguration);
                 });
-            perfScan->run();
-        });
+            });
+        perfScan->run();
+    });
 }
 
 // Check if InterfacesAdded payload contains an iface that needs probing.
@@ -625,7 +576,17 @@ void EntityManager::handleCurrentConfigurationJson()
                 }
                 else
                 {
-                    lastJson = std::move(data);
+                    std::optional<SystemConfiguration> optConfig =
+                        systemConfigurationFromJson(data);
+                    if (optConfig.has_value())
+                    {
+                        lastJson = optConfig.value();
+                    }
+                    else
+                    {
+                        lg2::error("Failed parsing last json at {PATH}", "PATH",
+                                   lastConfiguration);
+                    }
                 }
             }
             else
