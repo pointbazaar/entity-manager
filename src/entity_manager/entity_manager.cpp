@@ -3,6 +3,7 @@
 
 #include "entity_manager.hpp"
 
+#include "../dbus_regex.hpp"
 #include "../utils.hpp"
 #include "../variant_visitors.hpp"
 #include "configuration.hpp"
@@ -38,9 +39,6 @@ constexpr const char* lastConfiguration = "/tmp/configuration/last.json";
 
 static constexpr std::array<const char*, 6> settableInterfaces = {
     "FanProfile", "Pid", "Pid.Zone", "Stepwise", "Thresholds", "Polling"};
-
-const std::regex illegalDbusPathRegex("[^A-Za-z0-9_.]");
-const std::regex illegalDbusMemberRegex("[^A-Za-z0-9_]");
 
 sdbusplus::asio::PropertyPermission getPermission(const std::string& interface)
 {
@@ -146,8 +144,8 @@ void EntityManager::postBoardToDBus(
         findBoardType->type() == nlohmann::json::value_t::string)
     {
         boardType = findBoardType->get<std::string>();
-        std::regex_replace(boardType.begin(), boardType.begin(),
-                           boardType.end(), illegalDbusMemberRegex, "_");
+
+        dbus_regex::sanitizeMember(boardType);
     }
     else
     {
@@ -248,16 +246,16 @@ void EntityManager::postExposesRecordsToDBus(
     if (findType != item.end())
     {
         itemType = findType->get<std::string>();
-        std::regex_replace(itemType.begin(), itemType.begin(), itemType.end(),
-                           illegalDbusPathRegex, "_");
+        dbus_regex::sanitizePath(itemType);
     }
     else
     {
         itemType = "unknown";
     }
     std::string itemName = findName->get<std::string>();
-    std::regex_replace(itemName.begin(), itemName.begin(), itemName.end(),
-                       illegalDbusMemberRegex, "_");
+
+    dbus_regex::sanitizeMember(itemName);
+
     std::string ifacePath = boardPath;
     ifacePath += "/";
     ifacePath += itemName;
