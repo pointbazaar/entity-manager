@@ -104,45 +104,56 @@ void handleLeftOverTemplateVars(nlohmann::json::array_t& value)
     }
 }
 
+// @brief    finds a template var in a string
+// @returns  subrange where the template var was found
+// @returns  std::nullopt  if no template var was found
+static std::optional<std::ranges::subrange<std::string::const_iterator>>
+    findLeftOverTemplateVar(std::string& value)
+{
+    // Walking through the string to find $<templateVar>
+    const std::ranges::subrange<std::string::const_iterator> findStart =
+        iFindFirst(value, std::string_view(templateChar));
+
+    if (!findStart)
+    {
+        return std::nullopt;
+    }
+
+    const std::ranges::subrange<std::string::const_iterator> searchRange(
+        findStart.end(), value.end());
+
+    const std::ranges::subrange<std::string::const_iterator> findSpace =
+        iFindFirst(searchRange, " ");
+
+    // No space means the template var spans to the end of
+    // of the keyPair value, otherwise a space marks the end
+
+    return std::ranges::subrange<std::string::const_iterator>(
+        findStart.begin(), (findSpace) ? findSpace.begin() : value.end());
+}
+
+static bool handleLeftOverTemplateVarOnce(std::string& value)
+{
+    const std::optional<std::ranges::subrange<std::string::const_iterator>> tv =
+        findLeftOverTemplateVar(value);
+
+    if (!tv.has_value())
+    {
+        return false;
+    }
+
+    lg2::error(
+        "There's still template variable {VAR} un-replaced. Removing it from the string.\n",
+        "VAR", tv.value());
+    value.erase(tv.value().begin(), tv.value().end());
+
+    return true;
+}
+
 void handleLeftOverTemplateVars(std::string& value)
 {
-    std::string* strPtr = &value;
-    // Walking through the string to find $<templateVar>
-    while (true)
-    {
-        std::ranges::subrange<std::string::const_iterator> findStart =
-            iFindFirst(*strPtr, std::string_view(templateChar));
-
-        if (!findStart)
-        {
-            break;
-        }
-
-        std::ranges::subrange<std::string::iterator> searchRange(
-            strPtr->begin() + (findStart.end() - strPtr->begin()),
-            strPtr->end());
-        std::ranges::subrange<std::string::const_iterator> findSpace =
-            iFindFirst(searchRange, " ");
-
-        std::string::const_iterator templateVarEnd;
-
-        if (!findSpace)
-        {
-            // No space means the template var spans to the end of
-            // of the keyPair value
-            templateVarEnd = strPtr->end();
-        }
-        else
-        {
-            // A space marks the end of a template var
-            templateVarEnd = findSpace.begin();
-        }
-
-        lg2::error(
-            "There's still template variable {VAR} un-replaced. Removing it from the string.\n",
-            "VAR", std::string(findStart.begin(), templateVarEnd));
-        strPtr->erase(findStart.begin(), templateVarEnd);
-    }
+    while (handleLeftOverTemplateVarOnce(value))
+    {}
 }
 
 // Replaces the template character like the other version of this function,
