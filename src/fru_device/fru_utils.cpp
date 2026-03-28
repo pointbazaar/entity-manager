@@ -3,7 +3,7 @@
 
 #include "fru_utils.hpp"
 
-#include "../dbus_regex.hpp"
+#include "../dbus_util.hpp"
 #include "gzip_utils.hpp"
 
 #include <phosphor-logging/lg2.hpp>
@@ -1672,7 +1672,7 @@ std::optional<std::string> getProductName(
         !productNameFind->second.empty())
     {
         productName =
-            dbus_regex::sanitizeForDBusMember(productNameFind->second);
+            dbus_util::sanitizeForDBusPathSegment(productNameFind->second);
     }
     else
     {
